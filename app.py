@@ -1,13 +1,14 @@
 from flask import Flask, jsonify, request, redirect, url_for
 import pymongo
 from bson.objectid import ObjectId
-from bson.json_util import dumps
+from bson.json_util import dumps, loads
 from werkzeug.exceptions import HTTPException
-
+from functools import wraps
 
 app = Flask(__name__)
 client = pymongo.MongoClient()
 apiConfig = client['api-config']
+schemas = apiConfig['schemas']
 
 
 class mongoCustomException(Exception):
@@ -37,17 +38,22 @@ class notFound(mongoCustomException):
         return dumps(self, default=lambda o: o.__dict__)
 
 
-@app.errorhandler(mongoCustomException)
-def handle_duplicate_resource(error):
-    response = error.toJson()
-    return response
+def getDBName(username, databaseName):
+    return f"{username}-{databaseName}"
 
 
-def addToConfig(emailID, configData):
+def addToConfig(**kwargs):
     configDB = apiConfig['config']
-    configData['emailID'] = emailID
-    configDB.insert_one(configData)
-    print('stored in config')
+    configDB.insert_one({**kwargs})
+
+
+def dbExists(databaseName, storedDB):
+    dblist = client.list_database_names()
+    configDB = apiConfig['config']
+    if storedDB not in dblist:
+        if not configDB.find_one({"databaseName": databaseName}):
+            return False
+    return True
 
 
 @app.errorhandler(HTTPException)
@@ -62,154 +68,233 @@ def handle_exception(e):
     return response
 
 
+@app.errorhandler(mongoCustomException)
+def handle_duplicate_resource(error):
+    response = error.toJson()
+    return response
+
+
+def getUserName(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        print("wrapper running!")
+        username = request.headers['username']
+        return function(username, *args, **kwargs)
+    return wrapper
+
+
+def getActualDB(function):
+    @wraps(function)
+    def fnwrapper(username, databaseName, *args, **kwargs):
+        print("wrapper running!")
+        storedDB = getDBName(username, databaseName)
+        return function(databaseName, storedDB, *args, **kwargs)
+    return fnwrapper
+
+
+def collectionExists(db, collectionName):
+    if collectionName in db.list_collection_names():
+        return True
+    return False
+
+
 @app.route('/')
 def hello():
     return 'welcome to UDAPI'
 
 
-@app.route('/users', methods=['GET'])
-def getUsers():
-    usersDB = apiConfig['users']
-    users = []
-    for user in usersDB.find():
-        users.append(user)
-    return dumps(users)
-
-
-@app.route('/users', methods=['POST'])
-def addUser():
-    usersDB = apiConfig['users']
-    userData = request.get_json()
-    if usersDB.find_one({"emailID": userData['emailID']}):
-        raise duplicateResource(
-            f"The user, {userData['emailID']}, already exists in the system.")
-    usersDB.insert_one(userData)
-    return jsonify({'message': 'User created successfully!'}), 200
-
-
-@app.route('/users/<emailID>/databases/', methods=['GET'])
-def viewDatabases(emailID):
-    configDB = apiConfig['config']
-    results = []
-    for result in configDB.find({'emailID': emailID}):
-        results.append(result['db_name'])
-    return dumps(results)
-
-
-@app.route('/users/<emailID>/databases/', methods=['POST'])
-def createDatabase(emailID):
+@app.route('/databases/mongo/', methods=['POST'])
+@getUserName
+def createDatabase(username):
     configData = request.get_json()
-    print(configData)
-    db_name = configData['db_name']
-    client[db_name]
-    print('db created')
-    addToConfig(emailID, configData)
-    return 'done'
+    databaseName = configData['databaseName']
+    processedDBName = getDBName(username, databaseName)
+    if dbExists(databaseName, processedDBName):
+        raise duplicateResource(
+            f"The database '{databaseName}' already exists.")
+    print('creating Db', processedDBName)
+    client[processedDBName]
+    addToConfig(**configData)
+    return jsonify({'code': 200, 'message': f"Database '{databaseName}' created successfully", "success": 1})
 
 
-@app.route('/users/<emailID>/databases/<databaseName>', methods=['GET'])
-def getConfigDetailsForOneDB(emailID, databaseName):
-    configDB = apiConfig['config']
-    result = configDB.find_one({"emailID": emailID, "db_name": databaseName})
-    return dumps(result)
+@app.route('/databases/mongo/<databaseName>', methods=['DELETE'])
+@getUserName
+@getActualDB
+def deleteDB(databaseName, storedDB):
+    if not dbExists(databaseName, storedDB):
+        raise notFound(f"Unknown database {databaseName}.")
+    client.drop_database(storedDB)
+    return jsonify({'code': 200, 'message': f"Database {databaseName} deleted successfully", "success": 1})
 
 
-@app.route('/users/<emailID>/databases/<databaseName>', methods=['PUT'])
-def updateDBConfig(emailID, databaseName):
-    data = request.get_json()
-    configDB = apiConfig['config']
-    configDB.find_one_and_update(
-        {"emailID": emailID, "db_name": databaseName}, {"$set": data})
-    return 'edited'
+@app.route('/databases/mongo/<databaseName>/', methods=['GET'])
+@getUserName
+@getActualDB
+def viewEntitySets(databaseName, storedDB):
+    if not dbExists(databaseName, storedDB):
+        raise notFound(f"Unknown database {databaseName}.")
+    db = client[storedDB]
+    print(dumps(db.list_collection_names()))
+    return dumps({"message": db.list_collection_names(), "success": 1})
 
 
-@app.route('/users/<emailID>/databases/<databaseName>', methods=['DELETE'])
-def deleteDB(emailID, databaseName):
-    configDB = apiConfig['config']
-    configDB.find_one_and_delete(
-        {"emailID": emailID, "db_name": databaseName})
-    client.drop_database(databaseName)
-    return 'deleted'
+@app.route('/databases/mongo/<databaseName>/', methods=['POST'])
+@getUserName
+@getActualDB
+def createEntitySet(databaseName, storedDB):
+    db = client[storedDB]
+    requestData = request.get_json()
+    entitySet = requestData['entitySetName']
+    if dbExists(databaseName, storedDB):
+        if collectionExists(db, entitySet):
+            raise duplicateResource(
+                f"Entity Set '{entitySet}' already exists.")
+        else:
+
+            newES = db[entitySet]
+            collectionSchema = {'databaseName': storedDB}
+            try:
+                for entry in requestData["attributes"]:
+                    collectionSchema[entry] = requestData['attributes'][entry]
+                print(collectionSchema)
+                schemas.insert_one(collectionSchema)
+                newES.insert_one({'test': 'data'})
+                newES.delete_one({'test': 'data'})
+                return jsonify({'code': 200, 'message': f"Entity Set '{entitySet}' created successfully", "success": 1})
+            except:
+                return jsonify({'code': 400, 'message': f"Attributes have to be incuded in the request", "success": 0})
+    else:
+        raise notFound(f"Unknown database {databaseName}.")
 
 
-@app.route('/users/<emailID>/databases/<databaseName>/', methods=['GET'])
-def viewEntitySets(emailID, databaseName):
-    db = client[databaseName]
-    return dumps(db.list_collection_names())
+@app.route('/databases/mongo/<databaseName>/<entitySetName>/', methods=['PUT'])
+@getUserName
+@getActualDB
+def updateEntitySetName(databaseName, storedDB, entitySetName):
+    db = client[storedDB]
+    eSet = db[entitySetName]
+    if dbExists(databaseName, storedDB):
+        if collectionExists(db, entitySetName):
+            newDbName = request.json['newEsName']
+            eSet.rename(newDbName)
+            return jsonify({'code': 200, 'message': f"Entity Set '{entitySetName}' updated to '{newDbName}' successfully", "success": 1})
+        else:
+            raise notFound(f"Unknown entity set '{entitySetName}''")
+    else:
+        raise notFound(f"Unknown database {databaseName}.")
 
 
-@app.route('/users/<emailID>/databases/<databaseName>/', methods=['POST'])
-def createEntitySet(emailID, databaseName):
-    db = client[databaseName]
-    entitySet = request.json['entity_set_name']
-    newES = db[entitySet]
-    newES.insert_one({'test': 'data'})
-    newES.delete_one({'test': 'data'})
-    return 'created'
+@app.route('/databases/mongo/<databaseName>/<entitySetName>/', methods=['DELETE'])
+@getUserName
+@getActualDB
+def deleteEntitySet(databaseName, storedDB, entitySetName):
+    db = client[storedDB]
+    if dbExists(databaseName, storedDB):
+        if collectionExists(db, entitySetName):
+            db.drop_collection(entitySetName)
+            return jsonify({'code': 200, 'message': f"Entity Set '{entitySetName}' deleted successfully", "success": 1})
+        else:
+            raise notFound(f"Unknown entity set '{entitySetName}''")
+    else:
+        raise notFound(f"Unknown database {databaseName}.")
 
 
-@app.route('/users/<emailID>/databases/<databaseName>/<entitySet>/', methods=['PUT'])
-def updateEntitySetName(emailID, databaseName, entitySet):
-    db = client[databaseName]
-    eSet = db[entitySet]
-    newDbName = request.json['newDbName']
-    eSet.rename(newDbName)
-    return 'updated'
+@app.route('/databases/mongo/<databaseName>/<entitySetName>/', methods=['GET'])
+@getUserName
+@getActualDB
+def viewAllEntities(databaseName, storedDB, entitySetName):
+    db = client[storedDB]
+    if dbExists(databaseName, storedDB):
+        if collectionExists(db, entitySetName):
+            eSet = db[entitySetName]
+            entities = eSet.find()
+            results = []
+            for entity in entities:
+                results.append(entity)
+            return dumps({"message": results, "success": 1})
+        else:
+            raise notFound(f"Unknown entity set '{entitySetName}''")
+    else:
+        raise notFound(f"Unknown database {databaseName}.")
 
 
-@app.route('/users/<emailID>/databases/<databaseName>/<entitySet>/', methods=['DELETE'])
-def deleteEntitySet(emailID, databaseName, entitySet):
-    db = client[databaseName]
-    db.drop_collection(entitySet)
-    return 'deleted'
+@app.route('/databases/mongo/<databaseName>/<entitySetName>/', methods=['POST'])
+@getUserName
+@getActualDB
+def createEntity(databaseName, storedDB, entitySetName):
+    db = client[storedDB]
+    if dbExists(databaseName, storedDB):
+        if collectionExists(db, entitySetName):
+            eSet = db[entitySetName]
+            data = request.get_json()
+            eSet.insert_one(data)
+            return jsonify({'code': 200, 'message': f"Entity created successfully", "success": 1})
+        else:
+            raise notFound(f"Unknown entity set '{entitySetName}''")
+    else:
+        raise notFound(f"Unknown database {databaseName}.")
 
 
-@app.route('/users/<emailID>/databases/<databaseName>/<entitySet>/', methods=['GET'])
-def viewAllEntities(emailID, databaseName, entitySet):
-    db = client[databaseName]
-    eSet = db[entitySet]
-    entities = eSet.find()
-    results = []
-    for entity in entities:
-        results.append(entity)
-    return dumps(results)
+@app.route('/databases/mongo/<databaseName>/<entitySetName>/<primaryKey>/', methods=['PUT'])
+@getUserName
+@getActualDB
+def updateEntityRecord(databaseName, storedDB, entitySetName, primaryKey):
+    db = client[storedDB]
+    if dbExists(databaseName, storedDB):
+        if collectionExists(db, entitySetName):
+            eSet = db[entitySetName]
+            data = request.get_json()
+            if eSet.find_one({"_id": ObjectId(primaryKey)}):
+                eSet.find_one_and_update(
+                    {"_id": ObjectId(primaryKey)}, {"$set": data})
+                return jsonify({'code': 200, 'message': f"Entity updated successfully", "success": 1})
+            else:
+                raise notFound('Entity does not exist.')
+        else:
+            raise notFound(f"Unknown entity set '{entitySetName}''")
+    else:
+        raise notFound(f"Unknown database {databaseName}.")
 
 
-@app.route('/users/<emailID>/databases/<databaseName>/<entitySet>/', methods=['POST'])
-def createEntity(emailID, databaseName, entitySet):
-    db = client[databaseName]
-    eSet = db[entitySet]
-    data = request.get_json()
-    entities = eSet.insert_one(data)
-    return 'done'
+@app.route('/databases/mongo/<databaseName>/<entitySetName>/<primaryKey>/', methods=['DELETE'])
+@getUserName
+@getActualDB
+def deleteEntityRecord(databaseName, storedDB, entitySetName, primaryKey):
+    db = client[storedDB]
+    if dbExists(databaseName, storedDB):
+        if collectionExists(db, entitySetName):
+            eSet = db[entitySetName]
+            if eSet.find_one({"_id": ObjectId(primaryKey)}):
+                eSet.find_one_and_delete(
+                    {"_id": ObjectId(primaryKey)})
+                return jsonify({'code': 200, 'message': f"Entity deleted successfully", "success": 1})
+            else:
+                raise notFound('Entity does not exist.')
+        else:
+            raise notFound(f"Unknown entity set '{entitySetName}''")
+    else:
+        raise notFound(f"Unknown database {databaseName}.")
 
 
-@app.route('/users/<emailID>/databases/<databaseName>/<entitySet>/<primaryKey>/', methods=['PUT'])
-def updateEntityRecord(emailID, databaseName, entitySet, primaryKey):
-    db = client[databaseName]
-    eSet = db[entitySet]
-    data = request.get_json()
-    eSet.find_one_and_update(
-        {"_id": ObjectId(primaryKey)}, {"$set": data})
-    return 'edited'
-
-
-@app.route('/users/<emailID>/databases/<databaseName>/<entitySet>/<primaryKey>/', methods=['DELETE'])
-def deleteEntityRecord(emailID, databaseName, entitySet, primaryKey):
-    db = client[databaseName]
-    eSet = db[entitySet]
-    eSet.find_one_and_delete(
-        {"_id": ObjectId(primaryKey)})
-    return 'deleted'
-
-
-@app.route('/users/<emailID>/databases/<databaseName>/<entitySet>/<primaryKey>/', methods=['GET'])
-def viewEntityRecord(emailID, databaseName, entitySet, primaryKey):
-    db = client[databaseName]
-    eSet = db[entitySet]
-    result = eSet.find(
-        {"_id": ObjectId(primaryKey)})
-    return dumps(result)
+@app.route('/databases/mongo/<databaseName>/<entitySetName>/<primaryKey>/', methods=['GET'])
+@getUserName
+@getActualDB
+def viewEntityRecord(databaseName, storedDB, entitySetName, primaryKey):
+    db = client[storedDB]
+    if dbExists(databaseName, storedDB):
+        if collectionExists(db, entitySetName):
+            eSet = db[entitySetName]
+            result = eSet.find(
+                {"_id": ObjectId(primaryKey)})
+            if result != None:
+                return dumps({"message": result, "success": 1})
+            else:
+                raise notFound('Entity does not exist.')
+        else:
+            raise notFound(f"Unknown entity set '{entitySetName}''")
+    else:
+        raise notFound(f"Unknown database {databaseName}.")
 
 
 if __name__ == "__main__":
